@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables — never commit secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Build / dist
+build/
+dist/
+*.whl
+
+# Logs
+*.log
+logs/
+
+# Coverage
+.coverage
+htmlcov/
+.tox/
+
+# Project-specific tmp
+tmp/
+
+# Jinja2 placeholder dirs (artifact of nginx-proxy-manager / certbot tooling);
+# cert.pem inside is a symlink to system CA bundle — must not be tracked.
+{{pkgetc}}/
+{{etc}}/
