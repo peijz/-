@@ -1,0 +1,45 @@
+# systemd unit —— 部署时放到 /etc/systemd/system/zhongyiguan.service
+#
+# 设计要点:
+#   - ExecStartPre 用 + 前缀以 root 跑 (读 MySQL 凭据), 主进程以 appuser 跑
+#   - 进程沙箱化 (ProtectSystem=strict + PrivateTmp)
+#   - 监听 127.0.0.1:8005, 对外由 Nginx 暴露
+#   - 日志写到 /var/log/zhongyiguan/app.log (配 logrotate)
+
+[Unit]
+Description=zhongyiguan (中医 AI 聊天助手)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=appuser
+Group=appuser
+WorkingDirectory=/opt/zhongyiguan
+
+# 1) 建库 (root 跑, 读 /etc/zhongyiguan/mysql_root.conf)
+ExecStartPre=+/opt/zhongyiguan/scripts/init_db.sh
+
+# 2) 起 app (appuser 跑, 读 /opt/zhongyiguan/.env)
+ExecStart=/opt/zhongyiguan/.venv/bin/uvicorn main:app \
+    --host 127.0.0.1 \
+    --port 8005 \
+    --workers ${APP_WORKERS:-2}
+
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+# 日志
+StandardOutput=append:/var/log/zhongyiguan/app.log
+StandardError=append:/var/log/zhongyiguan/app.log
+
+# 沙箱
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/zhongyiguan /opt/zhongyiguan
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

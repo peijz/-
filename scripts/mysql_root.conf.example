@@ -1,0 +1,22 @@
+# MySQL ops 账号凭据示例 —— 用于 scripts/init_db.sh 建库
+#
+# 部署步骤:
+#   sudo mkdir -p /etc/zhongyiguan
+#   sudo cp scripts/mysql_root.conf.example /etc/zhongyiguan/mysql_root.conf
+#   sudo chown root:root /etc/zhongyiguan/mysql_root.conf
+#   sudo chmod 600 /etc/zhongyiguan/mysql_root.conf
+#
+# === 先在 MySQL 里建一个低权限 ops 账号 (强烈不建议直接用 root) ===
+#
+#   CREATE USER 'zyg_admin'@'127.0.0.1' IDENTIFIED BY '<STRONG-PWD>';
+#   GRANT CREATE, ALTER, INDEX, REFERENCES ON *.* TO 'zyg_admin'@'127.0.0.1';
+#   FLUSH PRIVILEGES;
+#
+# zyg_admin 只用来"建库 + 后续加字段", 不要给它 DROP / GRANT OPTION。
+# 应用运行账号(在 .env 的 DB_URL 里)应单独再 CREATE, 只给 DML 权限。
+#
+# === 然后编辑下面的密码, 保存 ===
+
+[client]
+user = zyg_admin
+password = CHANGE-ME-STRONG-PASSWORD
