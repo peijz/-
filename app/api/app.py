@@ -13,6 +13,7 @@ from app.api.chat import router as chat_router
 from app.api.health import router as health_router
 from app.api.logging_middleware import RequestLoggingMiddleware
 from app.api.response import UnifiedResponseMiddleware
+from app.api.tongue import router as tongue_router
 from app.model.db import init_db
 
 
@@ -34,6 +35,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(chat_router)
     app.include_router(health_router)
+    app.include_router(tongue_router)
 
     @app.on_event("startup")
     async def _startup() -> None:

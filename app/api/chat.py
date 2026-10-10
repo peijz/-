@@ -235,6 +235,8 @@ def _extract_visible_text(role: str, raw_content: str) -> str:
         return raw_content
     if parsed.get("type") == "ai_followup":
         return parsed.get("text") or ""
+    if parsed.get("type") == "tongue_report":
+        return parsed.get("text") or "舌象辨证报告"
     if parsed.get("type") == "media" and role == "user":
         return parsed.get("text") or ""
     return raw_content

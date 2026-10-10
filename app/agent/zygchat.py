@@ -34,6 +34,7 @@ from redisvl.index import SearchIndex
 from redisvl.schema import IndexSchema
 from redisvl.redis.connection import RedisConnectionFactory
 from redisvl.query import VectorQuery
+from redisvl.exceptions import RedisSearchError
 from langchain.messages import HumanMessage, SystemMessage, AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import InjectedToolArg
@@ -315,6 +316,7 @@ class MiniMaxChatModel(BaseChatModel):
                 # 合并会得到重复列表，LangChain 多次执行同一 tool 后第二轮 MiniMax
                 # 会报 "duplicate tool_call id" (2013)。
                 seen_tool_ids: set = set()
+                chunks_yielded = 0
                 async for line in resp.aiter_lines():
                     if not line:
                         continue
@@ -327,6 +329,21 @@ class MiniMaxChatModel(BaseChatModel):
                         d = json.loads(raw)
                     except Exception:
                         continue
+                    # MiniMax 把鉴权 / 参数 / 限流等错误包成 HTTP 200 + 空 choices +
+                    # 非零 base_resp.status_code。若不在这里显式拦截，每个 SSE 行都会
+                    # 被下面的 choice/content 过滤吃掉，导致 _astream 一个 chunk 都不
+                    # yield，最后由 langchain-core 抛 "No generations found in stream."
+                    # ——根因被掩盖。
+                    base_resp = d.get("base_resp") if isinstance(d, dict) else None
+                    if (
+                        isinstance(base_resp, dict)
+                        and base_resp.get("status_code", 0) not in (0, None)
+                    ):
+                        raise RuntimeError(
+                            "MiniMax stream API error: "
+                            f"status_code={base_resp.get('status_code')}, "
+                            f"status_msg={base_resp.get('status_msg')!r}"
+                        )
                     choice = (d.get("choices") or [{}])[0]
                     if not choice:
                         continue
@@ -358,6 +375,16 @@ class MiniMaxChatModel(BaseChatModel):
                         {"finish_reason": finish_reason} if finish_reason else None
                     )
                     yield ChatGenerationChunk(message=message, generation_info=gen_info)
+                    chunks_yielded += 1
+
+                if chunks_yielded == 0:
+                    # 兜底：SSE 行全部被过滤（只发了 reasoning_content / 全是空 delta /
+                    # 上游提前关流）。此时不要让 langchain 抛 "No generations found in
+                    # stream."，否则定位不到根因。
+                    raise RuntimeError(
+                        "MiniMax stream returned no yieldable chunks "
+                        "(可能全部是 reasoning_content 或上游异常关闭)"
+                    )
 
 
 model = MiniMaxChatModel(
@@ -470,8 +497,13 @@ schema = IndexSchema.from_dict({
 })
 client = RedisConnectionFactory.get_redis_connection(REDIS_URL)
 index = SearchIndex(schema, client)
-if not index.exists():
+# 多 worker 并发加载模块时,exists() 与 create_index() 之间存在竞态窗口,
+# 两个进程都看到索引不存在就会后一个失败。直接调 create() 并吞掉 "Index already exists"。
+try:
     index.create()
+except RedisSearchError as e:
+    if "Index already exists" not in str(e):
+        raise
 
 
 class RedisVLMemoryStore:
@@ -680,9 +712,18 @@ def save_long_memory(
     fact: str,
     config: Annotated[RunnableConfig, InjectedToolArg()],
 ) -> str:
-    """写入重要事实到用户长期记忆；仅保存关键信息，闲聊内容禁止存入。
+    """写入一条稳定健康信号到用户长期记忆。
 
-    :param fact: 精简事实短句（建议 ≤ 30 字），长文本会被自动忽略。
+    需保存(满足任一即调本工具):
+      - 体质判定(如阳虚质、痰湿质、气虚)
+      - 主诉与持续时长(如失眠3个月、咳嗽1周)
+      - 关键症状(寒热偏好、出汗、二便、舌象、脉象)
+      - 作息/饮食/情志稳定模式(长期熬夜、常饮冷、易怒)
+      - 用药/调理反馈(如某方喝了3天胃痛缓解)
+
+    不存:问候、寒暄、追问选项、临时情绪、单次偶发事件。
+
+    :param fact: 精简事实短句（建议 ≤ 30 字），一条一个点。
     :return: 写入结果提示（含保存的原文）；若已有相似记忆则跳过并返回已有事实。
 
     去重策略：写入前先在该 user 范围内做 KNN 召回（cosine 距离 ≤ 0.08，
@@ -781,71 +822,29 @@ async def ensure_checkpointer_setup() -> None:
     logger.info("[checkpointer] AsyncRedisSaver ready")
 
 # Agent 与摘要共用同一个 model（顶部定义）；_summarize_and_save 通过 model.invoke 复用
-systemp_prompt = """
-一、角色定位
-你是合规专业的中医AI智能助手小二大夫，精通传统中医辨证、四诊合参、九体辨识、开中药药方与居家养生。提供中医健康咨询、体质辨识、养生科普服务、开具中药药方，不做西医诊断、不替代线下医师诊疗，全程合规服务。
-二、核心能力
-•规范问诊：按中医四诊逻辑收集主诉、症状、饮食、睡眠、二便、寒热、情志、舌脉等信息，信息不全主动追问，不盲目辨证。
-•精准辨证：依据四诊信息判定证型、病因病机、气血阴阳、寒热燥湿失衡状态。
-•体质调理：精准辨识中医体质，输出饮食、作息、情志、运动一体化长期养生方案。
-•合规科普：科普中药、方剂、穴位养生知识。
-•居家养生指导：提供艾灸、推拿、刮痧等安全可落地的居家外治方法及禁忌规范。
-三、长期记忆规则（强制执行）
-你拥有用户专属跨会话长期健康记忆，按用户独立隔离存储。记忆工具调用是强制的，不可凭感觉跳过：
+# v2: 拆分精简版。1856 → ~690 token,节省 ~62%。关键约束(合规红线/6 段结构/长期记忆强制/
+# 追问格式)保留;删了原版八(服务准则)和四(问诊流程,与核心能力合并)等冗余复述。
+systemp_prompt = """你是"小二大夫",合规的中医 AI 助手,做中医辨证咨询与居家养生指导。**不开西药、不做西医诊断、不替代线下诊疗、不承诺疗效、不涉玄学命理**。
 
-【必做】每次对话开场 → 立即调 recall_long_memory(query=用户主诉) 一次，把命中事实纳入本次辨证。
-【必做】本轮产生了新的稳定健康信息 → 当轮回复前必须先调 save_long_memory 入库，再继续作答。
+## 核心能力
+按四诊逻辑收集主诉/症状/寒热/二便/情志/舌脉,信息不全时主动追问,不全不辨证;依四诊判定证型病机;输出辨证结论、体质辨识、饮食/作息/穴位等可落地的居家养生方案。
 
-  需保存的信号（满足任一即存）：
-  - 体质判定（如"阳虚质""痰湿质"）
-  - 主诉与持续时长（如"失眠3个月""胃胀反复半年"）
-  - 关键症状（寒热偏好、出汗、大便、舌象、脉象）
-  - 作息/饮食/情志的稳定模式（如"长期熬夜""常饮冷"）
-  - 既往病史与正在用的中药/调理方案及其反馈
+## 回答结构(6 段,不可乱序/省略)
+1.症状体质汇总(当前+历史记忆) 2.中医辨证(证型+病机) 3.核心调理方向(治则)
+4.生活方案(饮食/作息/运动/情志) 5.穴位养生(穴位+操作+频次) 6.禁忌提醒
+语言通俗温和,无玄学夸大臆断。
 
-  不存的信号：问候、寒暄、追问选项、临时情绪、单次偶发事件。
-  事实必须精简为 ≤30 字的短句，每条只存一个事实点。
+## 长期记忆(必调,不可凭感觉跳过)
+- **开场**:立即调 recall_long_memory(query=用户主诉)纳入辨证
+- **新信号入库**:先调 save_long_memory 入库再作答(详则见该 tool description)
+- **按需**:用户要求遗忘 → delete_long_memory
 
-【按需】用户要求遗忘/删除某条记忆 → 调 delete_long_memory。
-四、标准问诊流程（固定不可乱序）
-所有问诊严格遵循四诊流程，信息不足不强行辨证作答：
-1.主诉：不适症状、持续时长、发作规律
-2.基础状态：饮食、睡眠、二便、出汗、精神状态
-3.辨证细节：寒热体感、口腔状态、情绪、作息习惯
-4.体征补充：主动询问舌象、脉象，完善辨证依据
-五、回答规范与固定结构
-语言通俗温和、专业客观，无玄学、无夸大、无主观臆断，统一输出结构：
-1.症状体质汇总：结合当前症状+历史记忆整合用户健康情况
-2.中医辨证解析：明确证型、病因病机、体质失衡根源
-3.核心调理方向：给出对应中医治则与整体调理思路
-4.生活调理方案：饮食、作息、运动、情志专项调理建议
-5.居家穴位养生：适配穴位、操作方法、使用频次
-6.禁忌提醒：明确忌口与不良习惯，规避加重风险
-六、合规红线（零容错）
-•严禁开具西药处方
-•严禁西医疾病、器质性病变确诊判断
-•严禁承诺治愈、根治、特效等疗效话术
-•严禁指导用户停药、改药、放弃线下就医
-•严禁封建迷信、玄学命理等非正统中医内容
-七、工具调用逻辑（强约束）
-•开场 → 必调 recall_long_memory（不可省）
-•本轮新增稳定健康信息 → 必调 save_long_memory（先存后答，不允许只答不存）
-•用户申请删除健康记录 → 调 delete_long_memory
-八、服务准则
-坚守正统中医辨证思维，依托用户长期健康记忆，提供安全、标准、可追溯的合规居家中医养生服务。
-九、结构化追问（强制格式）
-当且仅当需要用户从有限枚举项中确认信息时（寒热、舌苔、便质、睡眠等可枚举四诊要素），
-在回复末尾追加一个 [OPTIONS]...[/OPTIONS] JSON 代码块：
-
+## 结构化追问(仅寒热/舌苔/便质/睡眠等可枚举四诊要素时)
+末尾追加一个 [OPTIONS]...[/OPTIONS] JSON 块,例如:
 [OPTIONS]
-{"question": "您平时怕冷吗？", "options": ["很怕冷", "有点怕冷", "不怕冷", "怕热"]}
+{"question": "您平时怕冷吗?", "options": ["很怕冷","有点怕冷","不怕冷","怕热"]}
 [/OPTIONS]
-
-规则：
-- 每次只问一个追问，单选，2~6 个选项
-- 不要在 [OPTIONS] 块外重复追问文本
-- 开放性问题、辨证结论、调理方案不生成追问
-- 用户已回复该问题后不得重复追问
+每次 1 个追问,2~6 个选项,块外不要重复追问文本。开放性问题/辨证结论/调理方案不生成追问。
 """
 
 # Agent 本身（带 checkpointer，支持多轮会话 state.messages 累计）
@@ -1019,6 +1018,64 @@ def _summarize_and_save(user_id: str, user_text: str, ai_text: str) -> None:
             logger.info("[long_memory] auto-saved %d facts for user=%s", saved, user_id)
     except Exception as e:
         logger.warning("[long_memory] summarize failed: %s", e)
+
+
+def save_tongue_report_to_memory(user_id: str, report: Dict[str, Any]) -> int:
+    """舌象报告 → 长期记忆（结构化路径，绕开 LLM 抽取）。
+
+    为什么绕开 ``_summarize_and_save``：
+      - 舌象报告是结构化 JSON，直接构造事实短句更准，比让 LLM 二次抽取
+        更稳（避免二次幻觉）。
+      - 与 chat 路径的 summarize 并行存在：chat 走 LLM 抽自然语言事实，
+        tongue 走结构化字段。两者互不重复。
+
+    :param user_id: 业务 user_id（用于 TAG 隔离）。
+    :param report: ``report.model_dump()`` 出来的 dict，需含
+        ``tongue_features.tongue_color / coating_color`` 与
+        ``tcm_pattern.constitution``。
+    :return: 实际写入条数（已去重 / 已长度过滤）。
+
+    写入策略：
+      - 长度 < 4 字的条目跳过（与 ``save_long_memory`` tool 一致）。
+      - 先 KNN 召回，相似度 ≥ 0.92（距离 ≤ 0.08）视为重复，跳过写入。
+      - 单条 add_text 失败不影响其它条目。
+    """
+    saved = 0
+    try:
+        features = (report.get("tongue_features") or {}) if isinstance(report, dict) else {}
+        pattern = (report.get("tcm_pattern") or {}) if isinstance(report, dict) else {}
+        constitution = pattern.get("constitution") if isinstance(pattern, dict) else None
+        tongue_color = features.get("tongue_color") if isinstance(features, dict) else None
+        coating_color = features.get("coating_color") if isinstance(features, dict) else None
+
+        facts: List[str] = []
+        if constitution:
+            facts.append(f"舌象辨证: {constitution}")
+        if tongue_color and coating_color:
+            facts.append(f"舌象特征: 舌色{tongue_color},苔色{coating_color}")
+
+        for fact in facts:
+            if len(fact) < 4:
+                continue
+            try:
+                similar = long_memory_store.find_similar_with_score(
+                    text=fact, user_id=user_id, threshold=0.08, k=5,
+                )
+                if similar:
+                    logger.info(
+                        "[long_memory] skip duplicate tongue fact for user=%s: %r (similar=%s)",
+                        user_id, fact, f"{similar[0]['similarity']:.2f}",
+                    )
+                    continue
+                long_memory_store.add_text(text=fact, metdata={"user_id": user_id})
+                saved += 1
+            except Exception as e:
+                logger.warning("[long_memory] tongue save failed for fact=%r: %s", fact, e)
+        if saved:
+            logger.info("[long_memory] tongue auto-saved %d facts for user=%s", saved, user_id)
+    except Exception as e:
+        logger.warning("[long_memory] tongue summarize failed: %s", e)
+    return saved
 
 
 # LangChain 消息类 → 入库 role 的映射
