@@ -4,7 +4,7 @@
 
 策略:
   - DB 用内存 SQLite + StaticPool(conftest.py 已设 DB_URL=sqlite:///:memory:)
-  - 通过 monkeypatch ``_call_qwen_vl`` 模拟 DashScope 上游,完全离线可跑
+  - 通过 monkeypatch ``_call_minimax_vl`` 模拟 MiniMax 视觉上游,完全离线可跑
   - 1x1 透明 PNG 字节硬编码进 fixture,不写盘
 """
 
@@ -150,15 +150,15 @@ _GOOD_REPORT = {
 URL = "/tongue/analyze"
 
 
-def _stub_qwen_vl(monkeypatch, payload):
-    """monkeypatch app.api.tongue._call_qwen_vl 为给定返回。"""
+def _stub_minimax_vl(monkeypatch, payload):
+    """monkeypatch app.api.tongue._call_minimax_vl 为给定返回。"""
     async def _fake(_data_url: str, _symptoms: str) -> str:
         if isinstance(payload, Exception):
             raise payload
         if isinstance(payload, str):
             return payload
         return json.dumps(payload, ensure_ascii=False)
-    monkeypatch.setattr("app.api.tongue._call_qwen_vl", _fake)
+    monkeypatch.setattr("app.api.tongue._call_minimax_vl", _fake)
 
 
 def test_missing_token_returns_401(client):
@@ -179,7 +179,7 @@ def test_invalid_bearer_returns_401(client):
 
 def test_invalid_mime_returns_400(client, auth_header, monkeypatch):
     """非 jpg/png → 400 invalid_type。"""
-    _stub_qwen_vl(monkeypatch, _GOOD_REPORT)
+    _stub_minimax_vl(monkeypatch, _GOOD_REPORT)
     r = client.post(
         URL,
         headers=auth_header(),
@@ -191,7 +191,7 @@ def test_invalid_mime_returns_400(client, auth_header, monkeypatch):
 
 def test_oversize_returns_413(client, auth_header, monkeypatch):
     """超过 10MB → 413 too_large(用 11MB bytes 探顶)。"""
-    _stub_qwen_vl(monkeypatch, _GOOD_REPORT)
+    _stub_minimax_vl(monkeypatch, _GOOD_REPORT)
     big = b"\x00" * (11 * 1024 * 1024)
     r = client.post(
         URL,
@@ -204,7 +204,7 @@ def test_oversize_returns_413(client, auth_header, monkeypatch):
 
 def test_happy_path_returns_structured_report(client, auth_header, monkeypatch):
     """1KB 有效 PNG + user_symptoms → 200,响应字段全在 schema 内。"""
-    _stub_qwen_vl(monkeypatch, _GOOD_REPORT)
+    _stub_minimax_vl(monkeypatch, _GOOD_REPORT)
     r = client.post(
         URL,
         headers=auth_header(),
@@ -228,7 +228,7 @@ def test_happy_path_returns_structured_report(client, auth_header, monkeypatch):
 def test_markdown_fence_is_stripped(client, auth_header, monkeypatch):
     """LLM 返回 ```json ... ``` 围栏,endpoint 应能剥掉并解析。"""
     fenced = "```json\n" + json.dumps(_GOOD_REPORT, ensure_ascii=False) + "\n```"
-    _stub_qwen_vl(monkeypatch, fenced)
+    _stub_minimax_vl(monkeypatch, fenced)
     r = client.post(
         URL,
         headers=auth_header(),
@@ -238,9 +238,45 @@ def test_markdown_fence_is_stripped(client, auth_header, monkeypatch):
     assert r.json()["data"]["summary"] == _GOOD_REPORT["summary"]
 
 
+def test_chat_model_preamble_is_extracted(client, auth_header, monkeypatch):
+    """LLM 在 JSON 前后加了解释/前缀文字(MiniMax-M3 常见),仍应解析成功。
+
+    模拟输出: ``好的,这是分析: {...完整 JSON...} 如有疑问请咨询医生。``
+    """
+    pure = json.dumps(_GOOD_REPORT, ensure_ascii=False)
+    dirty = f"好的,根据您上传的舌象,我分析如下:\n{pure}\n如有疑问请咨询专业中医师。"
+    _stub_minimax_vl(monkeypatch, dirty)
+    r = client.post(
+        URL,
+        headers=auth_header(),
+        files={"image": ("t.png", _PNG_BYTES, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["summary"] == _GOOD_REPORT["summary"]
+
+
+def test_unknown_field_value_is_accepted(client, auth_header, monkeypatch):
+    """LLM 按 system prompt 把看不出的字段填 ``"无法判断"``,应通过校验。
+
+    复现线上 422:sublingual_vessels 写真实看不清时 LLM 会输出 "无法判断",
+    schema 之前只接受 4 个候选值 → 全军覆没。
+    """
+    report = json.loads(json.dumps(_GOOD_REPORT))  # deep copy
+    report["tongue_features"]["sublingual_vessels"] = "无法判断"
+    report["confidence_notes"] = "舌下络脉因角度受限未看清。"
+    _stub_minimax_vl(monkeypatch, report)
+    r = client.post(
+        URL,
+        headers=auth_header(),
+        files={"image": ("t.png", _PNG_BYTES, "image/png")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["tongue_features"]["sublingual_vessels"] == "无法判断"
+
+
 def test_invalid_json_returns_422(client, auth_header, monkeypatch):
     """LLM 返回非 JSON 文本 → 422 invalid_json。"""
-    _stub_qwen_vl(monkeypatch, "抱歉,我无法判断,请提供更清晰的图片")
+    _stub_minimax_vl(monkeypatch, "抱歉,我无法判断,请提供更清晰的图片")
     r = client.post(
         URL,
         headers=auth_header(),
@@ -255,7 +291,7 @@ def test_schema_violation_returns_422(client, auth_header, monkeypatch):
     bad = dict(_GOOD_REPORT)
     bad["tongue_features"] = dict(_GOOD_REPORT["tongue_features"])
     bad["tongue_features"]["tongue_color"] = "蔚蓝"  # 不在 Literal 里
-    _stub_qwen_vl(monkeypatch, bad)
+    _stub_minimax_vl(monkeypatch, bad)
     r = client.post(
         URL,
         headers=auth_header(),
@@ -265,8 +301,8 @@ def test_schema_violation_returns_422(client, auth_header, monkeypatch):
 
 
 def test_upstream_httpx_error_returns_502(client, auth_header, monkeypatch):
-    """DashScope 网络错误 → 502 upstream_error。"""
-    _stub_qwen_vl(monkeypatch, httpx.ConnectError("connection refused"))
+    """MiniMax 网络错误 → 502 upstream_error。"""
+    _stub_minimax_vl(monkeypatch, httpx.ConnectError("connection refused"))
     r = client.post(
         URL,
         headers=auth_header(),
@@ -278,7 +314,7 @@ def test_upstream_httpx_error_returns_502(client, auth_header, monkeypatch):
 
 def test_no_symptoms_still_works(client, auth_header, monkeypatch):
     """user_symptoms 缺省时也能跑通(不传 data 也行)。"""
-    _stub_qwen_vl(monkeypatch, _GOOD_REPORT)
+    _stub_minimax_vl(monkeypatch, _GOOD_REPORT)
     r = client.post(
         URL,
         headers=auth_header(),
@@ -291,7 +327,7 @@ def test_happy_path_persists_session_and_two_messages(client, auth_header, monke
     """成功路径落库: 新建 1 个 ChatSession + 2 条 ChatMessage(user 主诉 / assistant JSON 报告)。"""
     from app.model.chat_log import ChatMessage, ChatSession
 
-    _stub_qwen_vl(monkeypatch, _GOOD_REPORT)
+    _stub_minimax_vl(monkeypatch, _GOOD_REPORT)
     symptoms = "最近口苦"
     r = client.post(
         URL,
@@ -326,7 +362,7 @@ def test_failure_path_writes_nothing(client, auth_header, monkeypatch, db_sessio
     """失败路径(LLM 502)不写库: 不留孤儿 session / message。"""
     from app.model.chat_log import ChatMessage, ChatSession
 
-    _stub_qwen_vl(monkeypatch, httpx.ConnectError("connection refused"))
+    _stub_minimax_vl(monkeypatch, httpx.ConnectError("connection refused"))
     r = client.post(
         URL,
         headers=auth_header(),
@@ -341,7 +377,7 @@ def test_failure_path_writes_nothing(client, auth_header, monkeypatch, db_sessio
 def test_tongue_report_visible_text_in_chat_messages(client, auth_header, monkeypatch):
     """舌象报告的 assistant 消息通过 GET /chat/messages 拉出来时,
     PushContent 应是 summary 而不是截断的 JSON。"""
-    _stub_qwen_vl(monkeypatch, _GOOD_REPORT)
+    _stub_minimax_vl(monkeypatch, _GOOD_REPORT)
     r = client.post(
         URL,
         headers=auth_header(),
@@ -379,7 +415,7 @@ def test_happy_path_schedules_tongue_long_memory(client, auth_header, monkeypatc
 
     monkeypatch.setattr(zygchat, "save_tongue_report_to_memory", spy)
 
-    _stub_qwen_vl(monkeypatch, _GOOD_REPORT)
+    _stub_minimax_vl(monkeypatch, _GOOD_REPORT)
     r = client.post(
         URL,
         headers=auth_header(),
@@ -409,7 +445,7 @@ def test_failure_path_does_not_schedule_tongue_long_memory(client, auth_header, 
 
     monkeypatch.setattr(zygchat, "save_tongue_report_to_memory", spy)
 
-    _stub_qwen_vl(monkeypatch, httpx.ConnectError("connection refused"))
+    _stub_minimax_vl(monkeypatch, httpx.ConnectError("connection refused"))
     r = client.post(
         URL,
         headers=auth_header(),
@@ -423,38 +459,71 @@ def test_failure_path_does_not_schedule_tongue_long_memory(client, auth_header, 
 
 
 def test_save_tongue_report_to_memory_writes_and_dedupes(monkeypatch):
-    """直接调 zygchat.save_tongue_report_to_memory: 首次写入 2 条(constitution + 特征),
-    二次写入同 constitution 会被 KNN 去重跳过(constitution 那条)。
+    """直接调 zygchat.save_tongue_report_to_memory:首次按字段拆 5-8 条事实,
+    KNN 去重后实际写入 5+ 条;二次写入相同报告全部被去重。
     注意:本测试连真实 Redis,会污染开发库的该 user 记忆,故用一次性 user_id。"""
     from app.agent import zygchat
 
     # 用一次性 user_id 避免污染任何真实用户。RediSearch TAG 字段对带连字符的
     # 值在某些语法位置会报 "Syntax error near <hyphen>"，所以保持纯 hex/字母。
     test_uid = "tonguemem" + uuid.uuid4().hex[:8]
+    # 用语义差异较大的取值,确保拆出的事实 embedding 互不冲突,不被 KNN 误去重
     report = {
         "tongue_features": {
-            "tongue_color": "淡红",
-            "coating_color": "白苔",
+            "tongue_color": "红",
+            "coating_color": "黄苔",
+            "coating_thickness": "厚苔",
+            "moisture": "燥裂",
+            "tongue_shape": ["裂纹", "点刺"],
+            "sublingual_vessels": "迂曲",
+            "overall_impression": "湿热",
         },
-        "tcm_pattern": {"constitution": "气虚"},
+        "tcm_pattern": {"constitution": "阴虚"},
     }
 
-    # 第一次:应该写入 constitution + 特征两条
+    # 第一次:8 条(sublingual_vessels 也是有效值,全写入)。
+    # KNN 阈值 0.08 下,字段之间 embedding 距离可能 ≥ 阈值,部分事实可能被合并,
+    # 故用下限断言:确保主要维度都落库。
     saved1 = zygchat.save_tongue_report_to_memory(test_uid, report)
-    assert saved1 == 2
+    assert saved1 >= 5, f"期望至少 5 条独立事实,实际 {saved1}"
 
-    # 第二次(完全相同输入):两条都被去重跳过,saved=0
+    # 第二次(完全相同输入):全部被去重,saved=0
     saved2 = zygchat.save_tongue_report_to_memory(test_uid, report)
     assert saved2 == 0
 
-    # KNN 召回应当看到这 2 条事实
+    # KNN 召回应当看到所有有意义的字段
     docs = zygchat.long_memory_store.similarity_search(
-        query="舌象", filter={"user_id": test_uid}, k=10,
+        query="舌象", filter={"user_id": test_uid}, k=20,
+    )
+    facts = {d["page_content"] for d in docs}
+    assert any("辨证" in f and "阴虚" in f for f in facts)
+    assert any("舌色" in f and "红" in f for f in facts)
+    assert any("苔色" in f and "黄苔" in f for f in facts)
+
+
+def test_save_tongue_report_skips_unknown_values(monkeypatch):
+    """字段值为 ``"无法判断"`` 或缺失时应跳过,不写入无意义事实。"""
+    from app.agent import zygchat
+
+    test_uid = "tongueskip" + uuid.uuid4().hex[:8]
+    report = {
+        "tongue_features": {
+            "tongue_color": "无法判断",
+            "coating_color": "",  # 空字符串也跳过
+            "moisture": "无法判断",
+            "tongue_shape": ["无法判断"],  # list 中含"无法判断"应过滤
+            # sublingual_vessels 缺失 → 跳过
+        },
+        "tcm_pattern": {"constitution": "气虚"},
+    }
+    saved = zygchat.save_tongue_report_to_memory(test_uid, report)
+    # 应当只存 constitution 一条
+    assert saved == 1
+
+    docs = zygchat.long_memory_store.similarity_search(
+        query="舌象", filter={"user_id": test_uid}, k=20,
     )
     facts = {d["page_content"] for d in docs}
     assert "舌象辨证: 气虚" in facts
-    assert "舌象特征: 舌色淡红,苔色白苔" in facts
-
-    # 清理
-    ids = [d["id"] for d in docs if d["id"]]
-    zygchat.long_memory_store.delete_by_ids(ids)
+    # "无法判断"应被过滤,不进档案
+    assert not any("无法判断" in f for f in facts)

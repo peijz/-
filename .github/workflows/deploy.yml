@@ -1,0 +1,74 @@
+name: deploy
+
+# push 到 main 自动同步到生产服务器。
+# 前置(一次性):
+#   1. 服务器上 /opt/zhongyiguan 是 git 仓库,且能 pull GitHub(SSH deploy key 或 PAT)。
+#   2. /opt/zhongyiguan 目录可写,且 systemd 服务 zhongyiguan 可被当前 SSH 用户重启。
+#   3. GitHub repo Settings → Secrets → Actions 添加:
+#        SERVER_HOST  - 服务器地址 (如 1.2.3.4)
+#        SERVER_USER  - SSH 用户 (建议 root,需要 systemctl restart 权限)
+#        SERVER_SSH_KEY - 该用户的 SSH 私钥 (推荐 Ed25519)
+#
+# 失败定位:
+#   - 401/SSH 拒绝 → SERVER_SSH_KEY 不对 / 服务器 authorized_keys 没加
+#   - git pull 失败 → 服务器 GitHub 认证失败(检查 deploy key)
+#   - 健康检查 502/超时 → 服务起来了但端口没监听,看 /var/log/zhongyiguan/app.log
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Deploy to production
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          command_timeout: 3m
+          script: |
+            set -euo pipefail
+
+            echo "=== git pull ==="
+            cd /opt/zhongyiguan
+            # 先看有没有本地未提交/未跟踪改动,避免 reset 把现场干掉
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "WARNING: 服务器有未提交改动,跳过 reset,改用 pull:"
+              git status --porcelain
+              git pull --ff-only
+            else
+              git fetch origin main
+              git reset --hard origin/main
+            fi
+
+            echo "=== restart service ==="
+            systemctl restart zhongyiguan
+
+            echo "=== health check ==="
+            # 等启动,uvicorn 启动 + DB/Redis 健康检查通常 < 5s
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              sleep 1
+              if curl -fsS http://127.0.0.1:8005/health/live >/dev/null 2>&1; then
+                echo "OK: 进程存活"
+                if curl -fsS http://127.0.0.1:8005/health >/dev/null 2>&1; then
+                  echo "OK: 依赖(DB+Redis)就绪"
+                else
+                  echo "WARN: /health 返回非 200,DB/Redis 可能有问题,看日志:"
+                  tail -20 /var/log/zhongyiguan/app.log
+                fi
+                exit 0
+              fi
+            done
+
+            echo "FAIL: 服务 10s 内未就绪,日志如下:"
+            tail -50 /var/log/zhongyiguan/app.log
+            systemctl status zhongyiguan --no-pager || true
+            exit 1
