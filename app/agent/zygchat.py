@@ -505,6 +505,21 @@ except RedisSearchError as e:
     if "Index already exists" not in str(e):
         raise
 
+# ⚠ RediSearch prefix 过滤的坑:
+#   索引定义里 ``prefix: "mem"`` 仅约束 *新写入* 的 hash key 走 ``mem:`` 前缀,
+#   以及 *带过滤* 的 FT.SEARCH(@user_id:{...} / KNN 等)在 DIALECT=3 下会按 prefix
+#   范围检索。但下面两种情况 prefix 过滤会被**忽略**,会查出整个 Redis 实例
+#   所有 hash(包含别的索引的 mem_test:* / 业务自己写的 user:* 等),极易误判:
+#     1. ``FT.SEARCH <idx> *`` 不带过滤、也不显式 ``DIALECT 3`` —— 默认 DIALECT=1
+#        下 ``*`` 走全 hash 扫,不是按 prefix 扫;
+#     2. 显式过滤的 query 没传 ``DIALECT 3`` —— DIALECT=1/2 对 TAG 的解析更宽松,
+#        也可能漏掉 prefix。
+#   本模块所有 FT.SEARCH 都强制带 ``DIALECT 3``(见 similarity_search /
+#   delete_all_for_user / find_similar_with_score),业务不会受影响。
+#   但任何调试脚本 / redis-cli 里手敲 ``FT.SEARCH <idx> *`` 看到的 8 条结果,
+#   可能是另一索引 prefix 下的数据,排查时要切到 ``FT.SEARCH <idx> * DIALECT 3``,
+#   或者直接 ``FT.INFO <idx>`` 看 ``index_definition.prefixes`` 确认作用域。
+
 
 class RedisVLMemoryStore:
     """长期记忆向量存储的轻量封装（替代 LangChain 旧 RedisVectorStore）。
@@ -663,6 +678,49 @@ class RedisVLMemoryStore:
         if ids:
             client.delete(*ids)
 
+    @staticmethod
+    def delete_all_for_user(user_id: str, max_docs: int = 10000) -> int:
+        """按 TAG 过滤清掉该 user 在索引里的所有事实,返回删除条数。
+
+        与 ``delete_by_ids`` 区别:无需先 recall 再删,直接 FT.SEARCH 拿 ids 一锅端。
+        不动索引结构,只删数据(下次该 user 再有事实可正常写入)。
+
+        实现要点（踩坑记录）:
+          - 一次 ``FT.SEARCH`` 带 ``@user_id:{tag}`` 仅命中一页(实际 < user 总条数),
+            即使 ``LIMIT 0 10000`` 也只回这一页——所以必须循环到 ``raw[0]==0``。
+          - ``client.delete(*ids)`` 是 unlink/delete,索引条目随之消失,
+            下次 ``FT.SEARCH`` 自然少一条;循环终将收敛到 0。
+
+        :param user_id: 业务 user_id。
+        :param max_docs: 单次 FT.SEARCH 上限(防御性,真正清空靠循环)。
+        """
+        total = 0
+        while True:
+            raw = client.execute_command(
+                "FT.SEARCH", INDEX_NAME,
+                f"@user_id:{{{user_id}}}",
+                "RETURN", "0",
+                "DIALECT", "3",
+                "LIMIT", "0", str(max_docs),
+            )
+            if not raw or raw[0] == 0:
+                return total
+            # raw 形如 [total, id1, [], id2, [], ...]——只取 id 字段
+            ids: list[str] = []
+            for i in range(1, len(raw), 2):
+                if i < len(raw):
+                    doc_id = raw[i].decode() if isinstance(raw[i], bytes) else raw[i]
+                    if isinstance(doc_id, str) and doc_id:
+                        ids.append(doc_id)
+            if not ids:
+                # 防御:FT.SEARCH 报有命中却取不到 id,跳出避免死循环
+                return total
+            client.delete(*ids)
+            total += len(ids)
+            if len(ids) >= max_docs:
+                # 单次已拉满,max_docs 不够,调用方应调大或继续观察——此处避免死循环
+                return total
+
 
 # 模块级单例，便于各模块直接调用
 long_memory_store = RedisVLMemoryStore()
@@ -690,10 +748,17 @@ def recall_long_memory(
     query: str,
     config: Annotated[RunnableConfig, InjectedToolArg()],
 ) -> str:
-    """查询长期记忆，用于调取用户历史对话消息。
+    """查询长期记忆，调取用户历史对话和舌象报告中的健康事实。
 
-    :param query: 需要检索的信息描述（自然语言）。
+    :param query: 需要检索的信息描述（自然语言关键词，如 "舌象"、"体质"、"失眠"）。
+        **query 应使用具体医学/症状词**，不要用"我的健康档案"这种抽象词——
+        后者跟存储的事实（"舌色: 红" 等）语义距离远，召回为空。
     :return: 拼接好的事实列表（每行 `- <fact>`），无记忆时返回 "暂无相关记忆"。
+
+    使用提示:
+      - 用户问"我的健康档案/历史/总结"等总览类查询时,至少分 2-3 次调本工具,
+        每次覆盖一个维度(舌象 / 体质 / 症状),合并去重后给用户。
+      - 单次调用 k=3,维度多就调多次,不要指望一次召回覆盖所有事实。
     """
     user_id = _get_user_id(config)
     docs = long_memory_store.similarity_search(
@@ -838,6 +903,9 @@ systemp_prompt = """你是"小二大夫",合规的中医 AI 助手,做中医辨�
 - **开场**:立即调 recall_long_memory(query=用户主诉)纳入辨证
 - **新信号入库**:先调 save_long_memory 入库再作答(详则见该 tool description)
 - **按需**:用户要求遗忘 → delete_long_memory
+- **档案类查询**:用户问"我的健康档案/历史/总结/我有什么记录"等总览性问题时,
+  **必须分多次**调 recall_long_memory,每次换一个具体关键词(舌象 / 体质 / 症状 / 舌苔),
+  **合并去重**后给用户——单次抽象 query 召回为空是已知陷阱
 
 ## 结构化追问(仅寒热/舌苔/便质/睡眠等可枚举四诊要素时)
 末尾追加一个 [OPTIONS]...[/OPTIONS] JSON 块,例如:
@@ -913,6 +981,40 @@ def _recall_context_for(user_id: str, query: str, k: int = 3) -> str:
     return (
         "以下是关于该用户的长期健康记忆（来自历史对话），请综合参考：\n"
         f"{bullets}"
+    )
+
+
+# "我的健康档案"类总览查询的触发词。命中后程序侧只塞 hint 提示
+# LLM 主动调 recall_long_memory,不直接喂答案——保留 tool_calls 可审计。
+_PROFILE_TRIGGER_KEYWORDS = (
+    "档案",
+    "历史",
+    "总结",
+    "记录",
+    "健康状况",
+    "我有什么",
+    "我的情况",
+    "之前的",
+    "历次",
+    "以往",
+)
+
+
+def _is_profile_query(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    return any(kw in text for kw in _PROFILE_TRIGGER_KEYWORDS)
+
+
+def _profile_query_hint() -> str:
+    """档案类查询的 hint,提示 LLM 主动调 recall_long_memory。
+
+    不直接喂事实(避免掩盖 LLM 是否真去查了);让 LLM 自己多次 recall 后
+    综合输出。如果 LLM 偷懒不调,tool_calls 自然是空的,容易暴露。
+    """
+    return (
+        "用户询问的是健康档案/历史记录总览。请主动调用 recall_long_memory "
+        "工具,分别用关键词 '舌象'、'体质'、'症状' 各查一次,合并去重后回答。"
     )
 
 
@@ -1248,6 +1350,10 @@ def chat(
     # 3. 调 agent：invoke 会把 HumanMessage 写进 checkpointer，state.messages 累计
     human_content = _build_human_content(text, images, videos)
     extra_context = _recall_context_for(user_id, text or "用户最近健康状况")
+    # 档案类查询:程序侧只塞 hint,不直接喂召回结果——保留 LLM 自己调 tool 的可审计性
+    if _is_profile_query(text):
+        hint = _profile_query_hint()
+        extra_context = (extra_context + "\n\n" + hint) if extra_context else hint
     invoke_messages: List[Any] = []
     if extra_context:
         invoke_messages.append(SystemMessage(content=extra_context))
@@ -1401,6 +1507,9 @@ async def chat_stream(
     accumulated: List[str] = []
     human_content = _build_human_content(text, images, videos)
     extra_context = _recall_context_for(user_id, text or "用户最近健康状况")
+    if _is_profile_query(text):
+        hint = _profile_query_hint()
+        extra_context = (extra_context + "\n\n" + hint) if extra_context else hint
     invoke_messages: List[Any] = []
     if extra_context:
         invoke_messages.append(SystemMessage(content=extra_context))

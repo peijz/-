@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import threading
@@ -138,6 +139,10 @@ _SYSTEM_PROMPT = """你是资深中医师,正通过患者上传的舌象照片�
 
 _MAX_UPLOAD_MB = int(os.getenv("TONGUE_MAX_UPLOAD_MB", "10"))
 _ALLOWED_MIME = {"image/jpeg", "image/png"}
+# 完整 TongueReport(8 维舌象 + 病机 + 调理方案 5 段 + summary 等)
+# 实测输出 ~2500-3500 token,MiniMax-M3 默认 max_tokens 不够,会截断导致 422。
+# 显式设 4096 留余量。
+_MAX_TOKENS = int(os.getenv("TONGUE_MAX_TOKENS", "4096"))
 
 
 _vl_model = zygchat.MiniMaxChatModel(
@@ -167,7 +172,7 @@ async def _call_minimax_vl(data_url: str, user_symptoms: str) -> str:
         HumanMessage(content=user_content),
     ]
 
-    msg = await _vl_model.ainvoke(messages)
+    msg = await _vl_model.ainvoke(messages, max_tokens=_MAX_TOKENS)
     content = msg.content or ""
     return content if isinstance(content, str) else str(content)
 
@@ -180,6 +185,10 @@ def _strip_code_fence(text: str) -> str:
     return _FENCE_RE.sub("", text.strip()).strip()
 
 
+class JSONTruncatedError(RuntimeError):
+    """LLM 输出 JSON 写到一半被截断(max_tokens 撞墙 / 网络截断)。"""
+
+
 def _extract_json_object(text: str) -> str:
     """从 LLM 输出中找第一个 brace 平衡的 JSON 对象。
 
@@ -188,10 +197,13 @@ def _extract_json_object(text: str) -> str:
     导致 Pydantic 校验失败。这里走括号深度计数 + 字符串字面量识别,定位
     第一个真正闭合的顶层 ``}``,把前后缀干净地砍掉。
 
-    找不到(LLM 完全没出 JSON)就原样返回,交给 Pydantic 报 422。
+    找不到顶层 ``}``(写到一半被截断)抛 :class:`JSONTruncatedError`,
+    便于上层区分"客户端给的图片没问题,是上游 LLM 输出不全"——可以建议用户重试,
+    而不是让 Pydantic 报一条难懂的 JSON 语法错。
     """
     start = text.find("{")
     if start < 0:
+        # LLM 完全没输出 JSON 对象(例如全是解释文字),让 Pydantic 自己报错
         return text
     depth = 0
     in_string = False
@@ -214,8 +226,10 @@ def _extract_json_object(text: str) -> str:
             depth -= 1
             if depth == 0:
                 return text[start : i + 1]
-    # 没找到闭合,说明 LLM 输出被截断 / 缺右括号,返回从首个 { 到末尾(让 Pydantic 给出更明确的报错)
-    return text[start:]
+    # 没找到闭合 → LLM 输出被截断(max_tokens 撞墙是常见原因)。
+    raise JSONTruncatedError(
+        f"LLM JSON 输出未闭合,总长 {len(text)} 字符,起始于 '...' "
+    )
 
 
 # =====================================================================
@@ -256,16 +270,24 @@ async def analyze_tongue(
         # 配置缺失等本侧错误,直接 502 也合理（属于上游不可用）
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=f"upstream_error: {e}")
 
-    cleaned = _extract_json_object(_strip_code_fence(raw_text))
     try:
+        cleaned = _extract_json_object(_strip_code_fence(raw_text))
         report = TongueReport.model_validate_json(cleaned)
+    except JSONTruncatedError as e:
+        # LLM 输出写到一半被截断(max_tokens 撞墙/网络截断),属上游问题 → 502 + 重试提示
+        logging.getLogger(__name__).warning(
+            "[tongue] truncated LLM output: %s head=%r", e, raw_text[:300],
+        )
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail="upstream_truncated: 模型输出未完成,请重新上传",
+        )
     except ValidationError as e:
         first = e.errors()[0] if e.errors() else {}
         loc = ".".join(str(p) for p in first.get("loc", ()))
         msg = first.get("msg", "")
         preview = cleaned[:200].replace("\n", " ")
         # 服务端留全量,客户端只回前 200 字避免泄漏舌诊数据
-        import logging
         logging.getLogger(__name__).warning(
             "[tongue] schema fail: loc=%s msg=%s raw_head=%r",
             loc, msg, cleaned[:500],

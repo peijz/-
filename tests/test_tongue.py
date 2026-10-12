@@ -161,6 +161,72 @@ def _stub_minimax_vl(monkeypatch, payload):
     monkeypatch.setattr("app.api.tongue._call_minimax_vl", _fake)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def sandbox_long_memory():
+    """把 zygchat 的 long memory 切到独立测试索引,避免污染 dev 数据。
+
+    原因: ``test_save_tongue_report_to_memory_writes_and_dedupes`` 等用例直接调
+    ``zygchat.save_tongue_report_to_memory``,会走真实 Redis + dev 索引
+    ``agent_long_memory_v2``。每次跑都往里塞 ``tonguemem*`` / ``tongueskip*``
+    前缀的事实,长期累积 100+ 条野生数据,污染 dev 长记忆召回。
+
+    实现: module-scope autouse,覆盖本模块全部用例。
+      1. 用同样 schema 建 ``agent_long_memory_v2_test`` 索引
+      2. monkeypatch ``zygchat.INDEX_NAME`` 和 ``zygchat.index`` 单例,让
+         ``add_text`` / ``find_similar_with_score`` / ``similarity_search`` /
+         ``delete_all_for_user`` 全部走测试索引
+      3. setup 时 clear 一次(清掉上次中断残留),teardown 时 drop 整个索引
+    """
+    from _pytest.monkeypatch import MonkeyPatch
+    from redis import exceptions as redis_exc
+    from redisvl.index import SearchIndex
+    from redisvl.schema import IndexSchema
+
+    from app.agent import zygchat
+
+    TEST_INDEX = "agent_long_memory_v2_test"
+    # ⚠ prefix 必须与 dev 索引不同:
+    #   redisvl SearchIndex 用 prefix 给 doc key 拼前缀 (mem:<uuid>);
+    #   两个索引用同一个 prefix 会共享同一批 hash 实体,search 谁都能查到对方的数据。
+    #   dev 用 ``mem``,测试用 ``mem_test``,物理隔离。
+    schema = IndexSchema.from_dict({
+        "index": {"name": TEST_INDEX, "prefix": "mem_test"},
+        "fields": [
+            {"name": "user_id", "type": "tag"},
+            {"name": "fact", "type": "text"},
+            {"name": "embedding", "type": "vector",
+             "attrs": {"algorithm": "flat", "dims": 1536,
+                       "distance_metric": "cosine", "datatype": "float32"}},
+        ],
+    })
+    test_index = SearchIndex(schema, zygchat.client)
+    try:
+        test_index.create()
+    except redis_exc.ResponseError as e:
+        if "Index already exists" not in str(e):
+            raise
+    # 清掉上次中断的残留数据(索引结构不变)
+    try:
+        test_index.clear()
+    except Exception:
+        pass
+
+    mp = MonkeyPatch()
+    mp.setattr(zygchat, "INDEX_NAME", TEST_INDEX)
+    mp.setattr(zygchat, "index", test_index)
+
+    yield TEST_INDEX
+
+    # delete(drop=True) 会 FT.DROPINDEX + 把 prefix 下的 hash key 全 unlink,
+    # 下次再跑测试也不会有上次残留。注意别用 ``drop``——SearchIndex 没有该方法,
+    # AttributeError 会被 except 吞,索引+keys 全部留着。
+    try:
+        test_index.delete(drop=True)
+    except Exception:
+        pass
+    mp.undo()
+
+
 def test_missing_token_returns_401(client):
     """缺 Authorization 头 → 401。"""
     r = client.post(URL, files={"image": ("t.png", _PNG_BYTES, "image/png")})
@@ -272,6 +338,23 @@ def test_unknown_field_value_is_accepted(client, auth_header, monkeypatch):
     )
     assert r.status_code == 200, r.text
     assert r.json()["data"]["tongue_features"]["sublingual_vessels"] == "无法判断"
+
+
+def test_truncated_llm_output_returns_502(client, auth_header, monkeypatch):
+    """LLM 输出 JSON 写到一半被截断(常见:max_tokens 撞墙),应返回 502 而非 422。
+
+    422 会让前端以为是用户输入问题,实际是上游服务问题。
+    错误信息应明确提示"重新上传"——客户端容易一键retry。
+    """
+    truncated = json.dumps(_GOOD_REPORT, ensure_ascii=False)[:120]  # 中间被截断
+    _stub_minimax_vl(monkeypatch, truncated)
+    r = client.post(
+        URL,
+        headers=auth_header(),
+        files={"image": ("t.png", _PNG_BYTES, "image/png")},
+    )
+    assert r.status_code == 502, r.text
+    assert "upstream_truncated" in r.json()["msg"]
 
 
 def test_invalid_json_returns_422(client, auth_header, monkeypatch):
@@ -499,6 +582,31 @@ def test_save_tongue_report_to_memory_writes_and_dedupes(monkeypatch):
     assert any("辨证" in f and "阴虚" in f for f in facts)
     assert any("舌色" in f and "红" in f for f in facts)
     assert any("苔色" in f and "黄苔" in f for f in facts)
+
+
+def test_delete_all_for_user_clears_all_pages(monkeypatch):
+    """回归 delete_all_for_user 的"单次 FT.SEARCH 只回一页"缺陷。
+
+    一次 ``FT.SEARCH`` 带 ``@user_id:{tag}`` 即便 ``LIMIT 0 10000`` 也只命中一页;
+    修复后必须循环到 ``raw[0]==0`` 才返回。
+
+    连真实 Redis,使用一次性 user_id + sandbox index 隔离(sandbox_memory fixture)。
+    """
+    from app.agent import zygchat
+
+    test_uid = "deltest" + uuid.uuid4().hex[:12]
+
+    # 一次性写 50 条同 user_id,确保单次 FT.SEARCH 命中 >1 页
+    for i in range(50):
+        zygchat.long_memory_store.add_text(f"待删事实{i}", {"user_id": test_uid})
+
+    # 修复前: 单次返回 < 50, 剩余 > 0
+    # 修复后: 必须全部清空,返回 50
+    deleted = zygchat.long_memory_store.delete_all_for_user(test_uid)
+    assert deleted == 50, f"期望清空 50 条,实际只删 {deleted}"
+
+    # 二次调用应立即返回 0(无残留)
+    assert zygchat.long_memory_store.delete_all_for_user(test_uid) == 0
 
 
 def test_save_tongue_report_skips_unknown_values(monkeypatch):
