@@ -1,17 +1,37 @@
 name: deploy
 
 # push 到 main 自动同步到生产服务器。
+#
+# 方案: SERVER_USER=zhongyiguan (方案 B — 单一用户做所有事,权限面最小)
+#   - 用仓库实际拥有者作为 SSH 登录用户,直接 git pull 不需要切用户
+#   - systemctl 通过 sudoers 单独命令免密,只在 workflow 脚本里 `sudo systemctl ...`
+#   - 不引入 SERVER_APP_USER 之类的角色拆分,也不把 root 的权限面扩大
+#
 # 前置(一次性):
-#   1. 服务器上 /opt/zhongyiguan 是 git 仓库,且能 pull GitHub(SSH deploy key 或 PAT)。
-#   2. /opt/zhongyiguan 目录可写,且 systemd 服务 zhongyiguan 可被当前 SSH 用户重启。
-#   3. GitHub repo Settings → Secrets → Actions 添加:
-#        SERVER_HOST  - 服务器地址 (如 1.2.3.4)
-#        SERVER_USER  - SSH 用户 (建议 root,需要 systemctl restart 权限)
-#        SERVER_SSH_KEY - 该用户的 SSH 私钥 (推荐 Ed25519)
+#   1. 服务器上 /opt/zhongyiguan 由 zhongyiguan 用户拥有:
+#        sudo chown -R zhongyiguan:zhongyiguan /opt/zhongyiguan
+#   2. zhongyiguan 用户的 ~/.ssh/ 有 GitHub deploy key:
+#        sudo -u zhongyiguan ssh -T git@github.com
+#        # 看到 "Hi <user>! You've successfully authenticated" 算通
+#   3. 给 zhongyiguan 加 sudoers 单独命令免密:
+#        echo "zhongyiguan ALL=(root) NOPASSWD: /bin/systemctl restart zhongyiguan, /bin/systemctl status zhongyiguan" \
+#          | sudo tee /etc/sudoers.d/zhongyiguan
+#        sudo chmod 440 /etc/sudoers.d/zhongyiguan
+#        # 验证不要求密码
+#        sudo -u zhongyiguan sudo -n systemctl status zhongyiguan
+#   4. GitHub repo Settings → Secrets → Actions 添加:
+#        SERVER_HOST     - 服务器地址 (如 1.2.3.4)
+#        SERVER_USER     - SSH 用户,固定 zhongyiguan
+#        SERVER_SSH_KEY  - zhongyiguan 用户的 SSH 私钥 (推荐 Ed25519)
+#
+# 为什么不用 root 登 (方案 A):
+#   root 通常没 GitHub deploy key,手动 `sudo git pull` 会永远挂在密码 prompt 上;
+#   强行给 root 配 key 又把权限面扩大了。方案 B 单一用户做所有事,链路最不容易踩坑。
 #
 # 失败定位:
 #   - 401/SSH 拒绝 → SERVER_SSH_KEY 不对 / 服务器 authorized_keys 没加
-#   - git pull 失败 → 服务器 GitHub 认证失败(检查 deploy key)
+#   - git pull 失败 → zhongyiguan 用户没 GitHub deploy key (ssh -T git@github.com)
+#   - systemctl: permission denied → 没配 /etc/sudoers.d/zhongyiguan,或文件权限不是 440
 #   - 健康检查 502/超时 → 服务起来了但端口没监听,看 /var/log/zhongyiguan/app.log
 
 on:
@@ -49,8 +69,9 @@ jobs:
               git reset --hard origin/main
             fi
 
-            echo "=== restart service ==="
-            systemctl restart zhongyiguan
+            echo "=== restart service (sudo) ==="
+            # zhongyiguan 没 systemctl 全局权限,通过 sudoers 单独命令免密
+            sudo systemctl restart zhongyiguan
 
             echo "=== health check ==="
             # 等启动,uvicorn 启动 + DB/Redis 健康检查通常 < 5s
@@ -70,5 +91,5 @@ jobs:
 
             echo "FAIL: 服务 10s 内未就绪,日志如下:"
             tail -50 /var/log/zhongyiguan/app.log
-            systemctl status zhongyiguan --no-pager || true
+            sudo systemctl status zhongyiguan --no-pager || true
             exit 1
