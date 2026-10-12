@@ -1021,38 +1021,78 @@ def _summarize_and_save(user_id: str, user_text: str, ai_text: str) -> None:
 
 
 def save_tongue_report_to_memory(user_id: str, report: Dict[str, Any]) -> int:
-    """舌象报告 → 长期记忆（结构化路径，绕开 LLM 抽取）。
+    """舌象报告 → 长期记忆(结构化路径,绕开 LLM 抽取)。
 
-    为什么绕开 ``_summarize_and_save``：
-      - 舌象报告是结构化 JSON，直接构造事实短句更准，比让 LLM 二次抽取
-        更稳（避免二次幻觉）。
-      - 与 chat 路径的 summarize 并行存在：chat 走 LLM 抽自然语言事实，
+    为什么绕开 ``_summarize_and_save``:
+      - 舌象报告是结构化 JSON,直接构造事实短句更准,比让 LLM 二次抽取
+        更稳(避免二次幻觉)。
+      - 与 chat 路径的 summarize 并行存在:chat 走 LLM 抽自然语言事实,
         tongue 走结构化字段。两者互不重复。
 
-    :param user_id: 业务 user_id（用于 TAG 隔离）。
-    :param report: ``report.model_dump()`` 出来的 dict，需含
-        ``tongue_features.tongue_color / coating_color`` 与
-        ``tcm_pattern.constitution``。
-    :return: 实际写入条数（已去重 / 已长度过滤）。
+    :param user_id: 业务 user_id(用于 TAG 隔离)。
+    :param report: ``report.model_dump()`` 出来的 dict,需含
+        ``tongue_features.*`` 与 ``tcm_pattern.constitution``。
+    :return: 实际写入条数(已去重 / 已长度过滤)。
 
-    写入策略：
-      - 长度 < 4 字的条目跳过（与 ``save_long_memory`` tool 一致）。
-      - 先 KNN 召回，相似度 ≥ 0.92（距离 ≤ 0.08）视为重复，跳过写入。
+    写入策略:
+      - 每个有意义的字段拆为独立短事实(constitution / 舌色 / 苔色 /
+        苔厚 / 润燥 / 舌形 / 舌下络脉 / 整体印象),便于后续召回时按
+        维度精准命中(例:用户说"最近舌苔厚不厚",能直接命中"苔厚"事实)。
+      - 值是 ``"无法判断"`` 或字段缺失 → 跳过(避免在档案里污染无意义事实)。
+      - 长度 < 4 字的条目跳过(与 ``save_long_memory`` tool 一致)。
+      - 先 KNN 召回,相似度 ≥ 0.92(距离 ≤ 0.08)视为重复,跳过写入。
       - 单条 add_text 失败不影响其它条目。
     """
+    UNKNOWN = "无法判断"
+
+    def _skip_unknown(v: Any) -> bool:
+        """值为 None / 空 / ``"无法判断"`` 时跳过该事实。"""
+        if not v:
+            return True
+        if isinstance(v, str) and v.strip() == UNKNOWN:
+            return True
+        return False
+
     saved = 0
     try:
         features = (report.get("tongue_features") or {}) if isinstance(report, dict) else {}
         pattern = (report.get("tcm_pattern") or {}) if isinstance(report, dict) else {}
-        constitution = pattern.get("constitution") if isinstance(pattern, dict) else None
-        tongue_color = features.get("tongue_color") if isinstance(features, dict) else None
-        coating_color = features.get("coating_color") if isinstance(features, dict) else None
 
         facts: List[str] = []
-        if constitution:
+
+        constitution = pattern.get("constitution") if isinstance(pattern, dict) else None
+        if not _skip_unknown(constitution):
             facts.append(f"舌象辨证: {constitution}")
-        if tongue_color and coating_color:
-            facts.append(f"舌象特征: 舌色{tongue_color},苔色{coating_color}")
+
+        tongue_color = features.get("tongue_color") if isinstance(features, dict) else None
+        if not _skip_unknown(tongue_color):
+            facts.append(f"舌色: {tongue_color}")
+
+        coating_color = features.get("coating_color") if isinstance(features, dict) else None
+        if not _skip_unknown(coating_color):
+            facts.append(f"苔色: {coating_color}")
+
+        coating_thickness = features.get("coating_thickness") if isinstance(features, dict) else None
+        if not _skip_unknown(coating_thickness):
+            facts.append(f"苔厚: {coating_thickness}")
+
+        moisture = features.get("moisture") if isinstance(features, dict) else None
+        if not _skip_unknown(moisture):
+            facts.append(f"舌质润燥: {moisture}")
+
+        tongue_shape = features.get("tongue_shape") if isinstance(features, dict) else None
+        if isinstance(tongue_shape, list) and tongue_shape:
+            valid_shape = [s for s in tongue_shape if isinstance(s, str) and s != UNKNOWN]
+            if valid_shape:
+                facts.append(f"舌形: {'+'.join(valid_shape)}")
+
+        sublingual_vessels = features.get("sublingual_vessels") if isinstance(features, dict) else None
+        if not _skip_unknown(sublingual_vessels):
+            facts.append(f"舌下络脉: {sublingual_vessels}")
+
+        overall_impression = features.get("overall_impression") if isinstance(features, dict) else None
+        if not _skip_unknown(overall_impression):
+            facts.append(f"舌象整体印象: {overall_impression}")
 
         for fact in facts:
             if len(fact) < 4:
